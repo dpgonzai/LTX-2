@@ -2,7 +2,7 @@ import os
 import time
 import warnings
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Protocol, runtime_checkable
 
 import torch
 import wandb
@@ -62,6 +62,76 @@ StepCallback = Callable[[int, int, list[Path]], None]  # (step, total, list[samp
 MEMORY_CHECK_INTERVAL = 200
 
 
+@runtime_checkable
+class TrainingCallback(Protocol):
+    """Protocol for training callbacks to enable custom integrations."""
+
+    def on_train_begin(self, trainer: "LtxvTrainer", config: "LtxTrainerConfig") -> None:
+        """Called at the start of training.
+
+        Args:
+            trainer: The trainer instance
+            config: The training configuration
+        """
+        ...
+
+    def on_step_end(
+        self,
+        step: int,
+        total_steps: int,
+        metrics: dict[str, float],
+        video_paths: list[Path]
+    ) -> None:
+        """Called after each training step.
+
+        Args:
+            step: Current training step
+            total_steps: Total number of training steps
+            metrics: Dictionary of training metrics (loss, lr, etc.)
+            video_paths: List of paths to validation videos (if any)
+        """
+        ...
+
+    def on_save(self, step: int, checkpoint_dir: Path) -> None:
+        """Called after a checkpoint is saved.
+
+        Args:
+            step: Current training step
+            checkpoint_dir: Path to the saved checkpoint directory
+        """
+        ...
+
+    def on_validation_begin(self, step: int) -> None:
+        """Called before validation sampling starts.
+
+        Args:
+            step: Current training step
+        """
+        ...
+
+    def on_validation_end(self, step: int, video_paths: list[Path]) -> None:
+        """Called after validation sampling completes.
+
+        Args:
+            step: Current training step
+            video_paths: List of paths to generated validation videos
+        """
+        ...
+
+    def on_train_end(self) -> None:
+        """Called at the end of training.
+        """
+        ...
+
+    def should_stop_training(self) -> bool:
+        """Check if training should be stopped early.
+
+        Returns:
+            True if training should stop, False otherwise
+        """
+        ...
+
+
 class TrainingStats(BaseModel):
     """Statistics collected during training"""
 
@@ -74,8 +144,9 @@ class TrainingStats(BaseModel):
 
 
 class LtxvTrainer:
-    def __init__(self, trainer_config: LtxTrainerConfig) -> None:
+    def __init__(self, trainer_config: LtxTrainerConfig, callbacks: list[TrainingCallback] | None = None) -> None:
         self._config = trainer_config
+        self._callbacks = callbacks or []
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
@@ -125,6 +196,10 @@ class LtxvTrainer:
 
         logger.info("🚀 Starting training...")
 
+        # Notify callbacks that training is starting
+        for callback in self._callbacks:
+            callback.on_train_begin(self, cfg)
+
         # Create progress tracking (disabled for non-main processes or when explicitly disabled)
         progress_enabled = IS_MAIN_PROCESS and not disable_progress_bars
         progress = TrainingProgress(
@@ -145,13 +220,28 @@ class LtxvTrainer:
         with progress:
             # Initial validation before training starts
             if cfg.validation.interval and not cfg.validation.skip_initial_validation:
+                for callback in self._callbacks:
+                    callback.on_validation_begin(self._global_step)
                 sampled_videos_paths = self._sample_videos(progress)
                 if IS_MAIN_PROCESS and sampled_videos_paths and self._config.wandb.log_validation_videos:
                     self._log_validation_samples(sampled_videos_paths, cfg.validation.prompts)
+                for callback in self._callbacks:
+                    callback.on_validation_end(self._global_step, sampled_videos_paths or [])
 
             self._accelerator.wait_for_everyone()
 
             for step in range(cfg.optimization.steps * cfg.optimization.gradient_accumulation_steps):
+                # Check callbacks for stop signal
+                should_stop = False
+                for callback in self._callbacks:
+                    if callback.should_stop_training():
+                        logger.info(f"Training stopped by callback at step {self._global_step}")
+                        should_stop = True
+                        break
+
+                if should_stop:
+                    break
+
                 # Get next batch, reset the dataloader if needed
                 try:
                     batch = next(data_iter)
@@ -187,6 +277,8 @@ class LtxvTrainer:
                         and self._global_step % cfg.validation.interval == 0
                         and is_optimization_step
                     ):
+                        for callback in self._callbacks:
+                            callback.on_validation_begin(self._global_step)
                         if self._accelerator.distributed_type == DistributedType.FSDP:
                             # FSDP: All processes must participate in validation
                             sampled_videos_paths = self._sample_videos(progress)
@@ -197,6 +289,8 @@ class LtxvTrainer:
                             sampled_videos_paths = self._sample_videos(progress)
                             if sampled_videos_paths and self._config.wandb.log_validation_videos:
                                 self._log_validation_samples(sampled_videos_paths, cfg.validation.prompts)
+                        for callback in self._callbacks:
+                            callback.on_validation_end(self._global_step, sampled_videos_paths or [])
 
                     # Save checkpoint if needed
                     if (
@@ -208,6 +302,21 @@ class LtxvTrainer:
                         self._save_checkpoint()
 
                     self._accelerator.wait_for_everyone()
+
+                    metrics = {
+                        "loss": loss.item(),
+                        "learning_rate": self._optimizer.param_groups[0]["lr"],
+                        "step": self._global_step,
+                    }
+
+                    # Notify callbacks of step completion
+                    for callback in self._callbacks:
+                        callback.on_step_end(
+                            self._global_step,
+                            cfg.optimization.steps,
+                            metrics,
+                            sampled_videos_paths or []
+                        )
 
                     # Call step callback if provided
                     if step_callback and is_optimization_step:
@@ -301,6 +410,9 @@ class LtxvTrainer:
 
         self._accelerator.wait_for_everyone()
         self._accelerator.end_training()
+
+        for callback in self._callbacks:
+            callback.on_train_end()
 
         return saved_path, stats
 
@@ -860,6 +972,10 @@ class LtxvTrainer:
 
         # Prepare paths
         save_dir = Path(self._config.output_dir) / "checkpoints"
+
+        for callback in self._callbacks:
+            callback.on_save(self._global_step, save_dir)
+
         prefix = "lora" if is_lora else "model"
         filename = f"{prefix}_weights_step_{self._global_step:05d}.safetensors"
         saved_weights_path = save_dir / filename
