@@ -324,6 +324,8 @@ class LtxvTrainer:
 
                     self._accelerator.wait_for_everyone()
 
+                    sampled_videos_paths = None
+
                     # Update progress and log metrics
                     current_lr = self._optimizer.param_groups[0]["lr"]
                     step_time = (time.time() - step_start_time) * cfg.optimization.gradient_accumulation_steps
