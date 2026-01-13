@@ -937,6 +937,7 @@ class LtxvTrainer:
                     stg_scale=self._config.validation.stg_scale,
                     stg_blocks=self._config.validation.stg_blocks,
                     stg_mode=self._config.validation.stg_mode,
+                    tiled_decoding=False
                 )
 
                 # Generate sample
