@@ -850,107 +850,137 @@ class LtxvTrainer:
         self._optimizer.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
 
-        # Start sampling progress tracking
-        sampling_ctx = progress.start_sampling(
-            num_prompts=len(self._config.validation.prompts),
-            num_steps=inference_steps,
-        )
+        # Set models to eval mode for validation (disables dropout, etc.)
+        # Save original training state to restore later
+        transformer_training = self._transformer.training
+        vae_decoder_training = self._vae_decoder.training if self._vae_decoder else None
+        vae_encoder_training = self._vae_encoder.training if self._vae_encoder else None
+        audio_vae_training = self._audio_vae.training if self._audio_vae else None
+        vocoder_training = self._vocoder.training if self._vocoder else None
 
-        # Create validation sampler with loaded models and progress tracking
-        sampler = ValidationSampler(
-            transformer=self._transformer,
-            vae_decoder=self._vae_decoder,
-            vae_encoder=self._vae_encoder,
-            text_encoder=None,
-            audio_decoder=self._audio_vae if generate_audio else None,
-            vocoder=self._vocoder if generate_audio else None,
-            sampling_context=sampling_ctx,
-        )
+        self._transformer.eval()
+        if self._vae_decoder:
+            self._vae_decoder.eval()
+        if self._vae_encoder:
+            self._vae_encoder.eval()
+        if self._audio_vae:
+            self._audio_vae.eval()
+        if self._vocoder:
+            self._vocoder.eval()
 
-        output_dir = Path(self._config.output_dir) / "samples"
-        output_dir.mkdir(exist_ok=True, parents=True)
-
-        video_paths = []
-        width, height, num_frames = self._config.validation.video_dims
-
-        for prompt_idx, prompt in enumerate(self._config.validation.prompts):
-            # Update progress to show current video
-            sampling_ctx.start_video(prompt_idx)
-
-            # Load conditioning image if provided
-            condition_image = None
-            if use_images:
-                image_path = self._config.validation.images[prompt_idx]
-                image = open_image_as_srgb(image_path)
-                # Convert PIL image to tensor [C, H, W] in [0, 1]
-                condition_image = F.to_tensor(image)
-
-            # Load reference video if provided (for IC-LoRA)
-            reference_video = None
-            if use_reference_videos:
-                ref_video_path = self._config.validation.reference_videos[prompt_idx]
-                # read_video returns [F, C, H, W] in [0, 1]
-                reference_video, _ = read_video(ref_video_path, max_frames=num_frames)
-
-            # Get cached embeddings for this prompt if available
-            cached_embeddings = (
-                self._cached_validation_embeddings[prompt_idx]
-                if self._cached_validation_embeddings is not None
-                else None
+        try:
+            # Start sampling progress tracking
+            sampling_ctx = progress.start_sampling(
+                num_prompts=len(self._config.validation.prompts),
+                num_steps=inference_steps,
             )
 
-            # Create generation config
-            gen_config = GenerationConfig(
-                prompt=prompt,
-                negative_prompt=self._config.validation.negative_prompt,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                frame_rate=self._config.validation.frame_rate,
-                num_inference_steps=inference_steps,
-                guidance_scale=self._config.validation.guidance_scale,
-                seed=self._config.validation.seed,
-                condition_image=condition_image,
-                reference_video=reference_video,
-                generate_audio=generate_audio,
-                include_reference_in_output=self._config.validation.include_reference_in_output,
-                cached_embeddings=cached_embeddings,
-                stg_scale=self._config.validation.stg_scale,
-                stg_blocks=self._config.validation.stg_blocks,
-                stg_mode=self._config.validation.stg_mode,
+            # Create validation sampler with loaded models and progress tracking
+            sampler = ValidationSampler(
+                transformer=self._transformer,
+                vae_decoder=self._vae_decoder,
+                vae_encoder=self._vae_encoder,
+                text_encoder=None,
+                audio_decoder=self._audio_vae if generate_audio else None,
+                vocoder=self._vocoder if generate_audio else None,
+                sampling_context=sampling_ctx,
             )
 
-            # Generate sample
-            video, audio = sampler.generate(
-                config=gen_config,
-                device=self._accelerator.device,
-            )
+            output_dir = Path(self._config.output_dir) / "samples"
+            output_dir.mkdir(exist_ok=True, parents=True)
 
-            # Save output (image for single frame, video otherwise)
-            if IS_MAIN_PROCESS:
-                ext = "png" if num_frames == 1 else "mp4"
-                output_path = output_dir / f"step_{self._global_step:06d}_{prompt_idx + 1}.{ext}"
-                if num_frames == 1:
-                    save_image(video, output_path)
-                else:
-                    save_video(
-                        video_tensor=video,
-                        output_path=output_path,
-                        fps=self._config.validation.frame_rate,
-                        audio=audio,
-                        audio_sample_rate=self._vocoder.output_sample_rate if audio is not None else None,
-                    )
-                video_paths.append(output_path)
+            video_paths = []
+            width, height, num_frames = self._config.validation.video_dims
 
-        # Clean up progress tasks
-        sampling_ctx.cleanup()
+            for prompt_idx, prompt in enumerate(self._config.validation.prompts):
+                # Update progress to show current video
+                sampling_ctx.start_video(prompt_idx)
 
-        # Clear GPU cache after validation
-        torch.cuda.empty_cache()
+                # Load conditioning image if provided
+                condition_image = None
+                if use_images:
+                    image_path = self._config.validation.images[prompt_idx]
+                    image = open_image_as_srgb(image_path)
+                    # Convert PIL image to tensor [C, H, W] in [0, 1]
+                    condition_image = F.to_tensor(image)
 
-        rel_outputs_path = output_dir.relative_to(self._config.output_dir)
-        logger.info(f"🎥 Validation samples for step {self._global_step} saved in {rel_outputs_path}")
-        return video_paths
+                # Load reference video if provided (for IC-LoRA)
+                reference_video = None
+                if use_reference_videos:
+                    ref_video_path = self._config.validation.reference_videos[prompt_idx]
+                    # read_video returns [F, C, H, W] in [0, 1]
+                    reference_video, _ = read_video(ref_video_path, max_frames=num_frames)
+
+                # Get cached embeddings for this prompt if available
+                cached_embeddings = (
+                    self._cached_validation_embeddings[prompt_idx]
+                    if self._cached_validation_embeddings is not None
+                    else None
+                )
+
+                # Create generation config
+                gen_config = GenerationConfig(
+                    prompt=prompt,
+                    negative_prompt=self._config.validation.negative_prompt,
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    frame_rate=self._config.validation.frame_rate,
+                    num_inference_steps=inference_steps,
+                    guidance_scale=self._config.validation.guidance_scale,
+                    seed=self._config.validation.seed,
+                    condition_image=condition_image,
+                    reference_video=reference_video,
+                    generate_audio=generate_audio,
+                    include_reference_in_output=self._config.validation.include_reference_in_output,
+                    cached_embeddings=cached_embeddings,
+                    stg_scale=self._config.validation.stg_scale,
+                    stg_blocks=self._config.validation.stg_blocks,
+                    stg_mode=self._config.validation.stg_mode,
+                )
+
+                # Generate sample
+                video, audio = sampler.generate(
+                    config=gen_config,
+                    device=self._accelerator.device,
+                )
+
+                # Save output (image for single frame, video otherwise)
+                if IS_MAIN_PROCESS:
+                    ext = "png" if num_frames == 1 else "mp4"
+                    output_path = output_dir / f"step_{self._global_step:06d}_{prompt_idx + 1}.{ext}"
+                    if num_frames == 1:
+                        save_image(video, output_path)
+                    else:
+                        save_video(
+                            video_tensor=video,
+                            output_path=output_path,
+                            fps=self._config.validation.frame_rate,
+                            audio=audio,
+                            audio_sample_rate=self._vocoder.output_sample_rate if audio is not None else None,
+                        )
+                    video_paths.append(output_path)
+
+            # Clean up progress tasks
+            sampling_ctx.cleanup()
+
+            # Clear GPU cache after validation
+            torch.cuda.empty_cache()
+
+            rel_outputs_path = output_dir.relative_to(self._config.output_dir)
+            logger.info(f"🎥 Validation samples for step {self._global_step} saved in {rel_outputs_path}")
+            return video_paths
+        finally:
+            # Restore original training state
+            self._transformer.train(transformer_training)
+            if self._vae_decoder:
+                self._vae_decoder.train(vae_decoder_training)
+            if self._vae_encoder:
+                self._vae_encoder.train(vae_encoder_training)
+            if self._audio_vae:
+                self._audio_vae.train(audio_vae_training)
+            if self._vocoder:
+                self._vocoder.train(vocoder_training)
 
     @staticmethod
     def _log_training_stats(stats: TrainingStats) -> None:
