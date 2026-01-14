@@ -423,14 +423,11 @@ class ValidationSampler:
 
         # Upsample video latent (2x spatial resolution)
         # Input: [B, C, F, H/2, W/2] → Output: [B, C, F, H, W]
-        print(f"num_frames == {config.num_frames}")
-        print(f"video_state_s1.latent.shape == {video_state_s1.latent.shape}")
         upscaled_latent = upsample_video(
             video_state_s1.latent[:1],  # Take first batch element
             video_encoder=self._vae_encoder,
             upsampler=self._spatial_upsampler
         )
-        print(f"upscaled_latent.shape == {upscaled_latent.shape}")
 
         # Move upsampler back to CPU to save VRAM
         self._spatial_upsampler.to("cpu")
@@ -446,38 +443,15 @@ class ValidationSampler:
             audio_tools_s2 = self._create_audio_latent_tools(config) if config.generate_audio else None
 
             # Initialize Stage 2 video state with upscaled latent
-            # Note: We need to reconstruct the LatentState with correct positions for full resolution
-            video_clean_state_s2 = video_tools_s2.create_initial_state(device=device, dtype=torch.bfloat16)
-
-            # Replace the latent with upscaled version but keep the positions and other metadata
-            video_state_s2 = LatentState(
-                latent=upscaled_latent,
-                denoise_mask=video_clean_state_s2.denoise_mask,
-                positions=video_clean_state_s2.positions,
-                clean_latent=upscaled_latent,  # Use upscaled as "clean" for Stage 2
+            # Pass upscaled_latent to create_initial_state, which will properly patchify it
+            video_clean_state_s2 = video_tools_s2.create_initial_state(
+                device=device,
+                dtype=torch.bfloat16,
+                initial_latent=upscaled_latent,  # Properly handles patchification
             )
 
             # Audio state remains from Stage 1 (no upsampling needed)
-            audio_state_s2 = audio_state_s1
             audio_clean_state_s2 = audio_clean_state_s1
-
-            # Apply image conditioning at full resolution if provided
-            if config.condition_image is not None:
-                # Re-apply conditioning at full resolution for the first frame
-                video_clean_state_s2_conditioned = self._apply_image_conditioning(
-                    video_clean_state_s2,
-                    config.condition_image,
-                    config,
-                    device,
-                )
-                # Merge: use conditioned first frame, upscaled for rest
-                # This is done by updating the denoise_mask to indicate which parts are conditioned
-                video_state_s2 = LatentState(
-                    latent=upscaled_latent,
-                    denoise_mask=video_clean_state_s2_conditioned.denoise_mask,
-                    positions=video_clean_state_s2_conditioned.positions,
-                    clean_latent=video_clean_state_s2_conditioned.clean_latent,
-                )
 
             # Create Stage 2 distilled scheduler (fixed 4 steps)
             # Using the distilled sigma schedule: [0.909375, 0.725, 0.421875, 0.0]
@@ -485,6 +459,15 @@ class ValidationSampler:
                 [0.909375, 0.725, 0.421875, 0.0],
                 device=device,
                 dtype=torch.float32,
+            )
+
+            # Add noise to Stage 2 states
+            noiser = GaussianNoiser(generator=generator)
+            video_state_s2 = noiser(latent_state=video_clean_state_s2, noise_scale=distilled_sigmas[0])
+            audio_state_s2 = (
+                noiser(latent_state=audio_clean_state_s2, noise_scale=distilled_sigmas[0])
+                if audio_clean_state_s2 is not None
+                else None
             )
 
             # Stage 2 denoising WITHOUT CFG (distilled model)
@@ -511,7 +494,7 @@ class ValidationSampler:
                 config=stage2_config,
                 video_state=video_state_s2,
                 audio_state=audio_state_s2,
-                video_clean_state=video_state_s2,  # Use upscaled as "clean"
+                video_clean_state=video_clean_state_s2,  # CORRECT: use clean state
                 audio_clean_state=audio_clean_state_s2,
                 v_ctx_pos=v_ctx_pos,
                 a_ctx_pos=a_ctx_pos,
@@ -803,7 +786,6 @@ class ValidationSampler:
         with torch.autocast(device_type=str(device).split(":")[0], dtype=torch.bfloat16):
             for step_idx, sigma in enumerate(sigmas[:-1]):
                 # Update modalities with current state and timesteps
-                print(f"video_state.latent.shape == {video_state.latent.shape}")
                 video = replace(
                     video,
                     latent=video_state.latent,
@@ -820,7 +802,6 @@ class ValidationSampler:
                     )
 
                 # Run model (positive pass) - X0Model returns denoised outputs
-                print(f"video.latent.shape == {video.latent.shape}")
                 pos_video, pos_audio = x0_model(video=video, audio=audio, perturbations=None)
                 denoised_video, denoised_audio = pos_video, pos_audio
 
