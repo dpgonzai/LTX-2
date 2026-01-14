@@ -120,6 +120,8 @@ class TransformerArgsPreprocessor:
         self,
         modality: Modality,
     ) -> TransformerArgs:
+        print(f"modality.latent.shape == {modality.latent.shape}")
+        print(f"patchify_proj.shape == {self.patchify_proj.weight.shape}")
         x = self.patchify_proj(modality.latent)
         timestep, embedded_timestep = self._prepare_timestep(modality.timesteps, x.shape[0], modality.latent.dtype)
         context, attention_mask = self._prepare_context(modality.context, x, modality.context_mask)
