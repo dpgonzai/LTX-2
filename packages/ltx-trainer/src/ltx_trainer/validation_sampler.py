@@ -349,7 +349,6 @@ class ValidationSampler:
         generator = torch.Generator(device=device).manual_seed(config.seed)
 
         # ==================== STAGE 1: Low-Resolution Generation ====================
-        logger.debug("Stage 1: Generating at half resolution")
 
         # Calculate Stage 1 dimensions (half resolution)
         stage1_width = config.width // 2
@@ -417,7 +416,6 @@ class ValidationSampler:
         video_state_s1 = video_tools_s1.unpatchify(video_state_s1)
 
         # ==================== SPATIAL UPSAMPLING ====================
-        logger.debug(f"Upsampling from {stage1_width}x{stage1_height} to {config.width}x{config.height}")
 
         # Move upsampler to device
         self._spatial_upsampler.to(device)
@@ -433,7 +431,6 @@ class ValidationSampler:
         self._spatial_upsampler.to("cpu")
 
         # ==================== STAGE 2: Refinement at Full Resolution ====================
-        logger.debug("Stage 2: Refining at full resolution")
 
         # Apply distilled LoRA to transformer (if configured)
         self._apply_distilled_lora()
@@ -560,7 +557,6 @@ class ValidationSampler:
             strength=lora_strength,
             sd_ops=None,  # Use default key mapping
         )
-        logger.debug(f"Prepared distilled LoRA configuration: {lora_path} (strength={lora_strength})")
 
     def _apply_distilled_lora(self) -> None:
         """Load transformer with distilled LoRA for Stage 2.
@@ -581,7 +577,6 @@ class ValidationSampler:
         self._base_transformer = self._transformer
         base_device = next(self._base_transformer.parameters()).device
         self._transformer.to("cpu")
-        logger.debug("Moved base transformer to CPU")
 
         # Load transformer with distilled LoRA from checkpoint
         builder = SingleGPUModelBuilder(
@@ -592,7 +587,6 @@ class ValidationSampler:
         )
 
         self._transformer = builder.build(device=base_device, dtype=torch.bfloat16).eval()
-        logger.debug(f"Loaded transformer with distilled LoRA for Stage 2")
 
     def _remove_distilled_lora(self) -> None:
         """Restore base transformer after Stage 2.
@@ -609,12 +603,10 @@ class ValidationSampler:
         # Delete distilled transformer
         del self._transformer
         torch.cuda.empty_cache()
-        logger.debug("Deleted distilled transformer from GPU")
 
         # Restore base transformer
         self._transformer = self._base_transformer.to(device)
         del self._base_transformer
-        logger.debug("Restored base transformer after Stage 2")
 
     def _create_video_latent_tools(self, config: GenerationConfig) -> VideoLatentTools:
         """Create video latent tools for the given configuration."""
