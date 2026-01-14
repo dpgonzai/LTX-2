@@ -423,11 +423,13 @@ class ValidationSampler:
 
         # Upsample video latent (2x spatial resolution)
         # Input: [B, C, F, H/2, W/2] → Output: [B, C, F, H, W]
+        print(f"video_state_s1.latent.shape == {video_state_s1.latent.shape}")
         upscaled_latent = upsample_video(
             video_state_s1.latent[:1],  # Take first batch element
             video_encoder=self._vae_encoder,
             upsampler=self._spatial_upsampler
         )
+        print(f"upscaled_latent.shape == {upscaled_latent.shape}")
 
         # Move upsampler back to CPU to save VRAM
         self._spatial_upsampler.to("cpu")
@@ -800,6 +802,7 @@ class ValidationSampler:
         with torch.autocast(device_type=str(device).split(":")[0], dtype=torch.bfloat16):
             for step_idx, sigma in enumerate(sigmas[:-1]):
                 # Update modalities with current state and timesteps
+                print(f"video_state.latent.shape == {video_state.latent.shape}")
                 video = replace(
                     video,
                     latent=video_state.latent,
@@ -816,6 +819,7 @@ class ValidationSampler:
                     )
 
                 # Run model (positive pass) - X0Model returns denoised outputs
+                print(f"video.latent.shape == {video.latent.shape}")
                 pos_video, pos_audio = x0_model(video=video, audio=audio, perturbations=None)
                 denoised_video, denoised_audio = pos_video, pos_audio
 
