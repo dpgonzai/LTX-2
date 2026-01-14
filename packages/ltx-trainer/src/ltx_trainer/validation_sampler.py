@@ -129,7 +129,7 @@ class ValidationSampler:
         audio_decoder: "AudioDecoder | None" = None,
         vocoder: "Vocoder | None" = None,
         spatial_upsampler: "LatentUpsampler | None" = None,
-        checkpoint_path: str | Path | None = None,
+        checkpoint_path: str | None = None,
         sampling_context: SamplingContext | None = None,
     ):
         """Initialize the validation sampler.
