@@ -514,7 +514,7 @@ class LtxvTrainer:
             checkpoint_path=self._config.model.model_path,
             device="cpu",
             dtype=torch.bfloat16,
-            with_video_vae_encoder=need_vae_encoder,  # Needed for image conditioning
+            with_video_vae_encoder=True, #need_vae_encoder,  # Needed for image conditioning
             with_video_vae_decoder=True,  # Needed for validation sampling
             with_audio_vae_decoder=load_audio,
             with_vocoder=load_audio,
