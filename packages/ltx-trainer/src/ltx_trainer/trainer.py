@@ -532,6 +532,18 @@ class LtxvTrainer:
         self._vocoder = components.vocoder
         # Note: self._text_encoder was set in _load_text_encoder_and_cache_embeddings
 
+        # Load spatial upsampler if two-stage validation is enabled
+        self._spatial_upsampler = None
+        if self._config.validation.two_stage:
+            logger.info("Loading spatial upsampler for two-stage validation...")
+            from ltx_trainer.model_loader import load_spatial_upsampler
+
+            self._spatial_upsampler = load_spatial_upsampler(
+                self._config.validation.spatial_upsampler_path,
+                device="cpu",  # Start on CPU, move to GPU during validation
+                dtype=torch.bfloat16,
+            )
+
         # Determine initial dtype based on training mode.
         # Note: For FSDP + LoRA, we'll cast to FP32 later in _prepare_models_for_training()
         # after the accelerator is set up, and we can detect FSDP.
@@ -857,6 +869,7 @@ class LtxvTrainer:
         vae_encoder_training = self._vae_encoder.training if self._vae_encoder else None
         audio_vae_training = self._audio_vae.training if self._audio_vae else None
         vocoder_training = self._vocoder.training if self._vocoder else None
+        upsampler_training = self._spatial_upsampler.training if self._spatial_upsampler else None
 
         self._transformer.eval()
         if self._vae_decoder:
@@ -867,6 +880,8 @@ class LtxvTrainer:
             self._audio_vae.eval()
         if self._vocoder:
             self._vocoder.eval()
+        if self._spatial_upsampler:
+            self._spatial_upsampler.eval()
 
         try:
             # Start sampling progress tracking
@@ -883,8 +898,17 @@ class LtxvTrainer:
                 text_encoder=None,
                 audio_decoder=self._audio_vae if generate_audio else None,
                 vocoder=self._vocoder if generate_audio else None,
+                spatial_upsampler=self._spatial_upsampler,
+                checkpoint_path=self._config.model.model_path,
                 sampling_context=sampling_ctx,
             )
+
+            # If two-stage validation, prepare distilled LoRA configuration
+            if self._config.validation.two_stage:
+                sampler.prepare_distilled_lora(
+                    lora_path=self._config.validation.distilled_lora_path,
+                    lora_strength=self._config.validation.distilled_lora_strength,
+                )
 
             output_dir = Path(self._config.output_dir) / "samples"
             output_dir.mkdir(exist_ok=True, parents=True)
@@ -937,7 +961,8 @@ class LtxvTrainer:
                     stg_scale=self._config.validation.stg_scale,
                     stg_blocks=self._config.validation.stg_blocks,
                     stg_mode=self._config.validation.stg_mode,
-                    tiled_decoding=False
+                    tiled_decoding=False,
+                    two_stage=self._config.validation.two_stage,
                 )
 
                 # Generate sample
@@ -982,6 +1007,8 @@ class LtxvTrainer:
                 self._audio_vae.train(audio_vae_training)
             if self._vocoder:
                 self._vocoder.train(vocoder_training)
+            if self._spatial_upsampler:
+                self._spatial_upsampler.train(upsampler_training)
 
     @staticmethod
     def _log_training_stats(stats: TrainingStats) -> None:

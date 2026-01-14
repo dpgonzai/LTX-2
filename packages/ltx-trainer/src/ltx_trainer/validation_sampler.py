@@ -93,6 +93,8 @@ class GenerationConfig:
     stg_mode: Literal["stg_av", "stg_v"] = "stg_av"  # STG mode: "stg_av" (audio+video) or "stg_v" (video only)
     # Tiled decoding config: None = use defaults (enabled), False = disable, or TiledDecodingConfig for custom settings
     tiled_decoding: TiledDecodingConfig | Literal[False] | None = None
+    # Two-stage generation: enables high-quality generation via half-res → upsampling → refinement
+    two_stage: bool = False
 
     def __post_init__(self) -> None:
         """Apply default tiled decoding config if not provided."""
@@ -126,6 +128,8 @@ class ValidationSampler:
         text_encoder: "AVGemmaTextEncoderModel | None" = None,
         audio_decoder: "AudioDecoder | None" = None,
         vocoder: "Vocoder | None" = None,
+        spatial_upsampler: "LatentUpsampler | None" = None,
+        checkpoint_path: str | Path | None = None,
         sampling_context: SamplingContext | None = None,
     ):
         """Initialize the validation sampler.
@@ -136,6 +140,8 @@ class ValidationSampler:
             text_encoder: Gemma text encoder with embeddings connector (optional if cached_embeddings in config)
             audio_decoder: Optional audio VAE decoder (for audio generation)
             vocoder: Optional vocoder (for audio generation)
+            spatial_upsampler: Optional spatial upsampler (for two-stage generation)
+            checkpoint_path: Optional path to model checkpoint (required for two-stage generation with distilled LoRA)
             sampling_context: Optional SamplingContext for progress display during denoising
         """
         self._transformer = transformer
@@ -144,7 +150,12 @@ class ValidationSampler:
         self._text_encoder = text_encoder
         self._audio_decoder = audio_decoder
         self._vocoder = vocoder
+        self._spatial_upsampler = spatial_upsampler
+        self._checkpoint_path = checkpoint_path
         self._sampling_context = sampling_context
+
+        # Distilled LoRA configuration (loaded on-demand for Stage 2 of two-stage generation)
+        self._distilled_lora_config = None
 
         # Patchifiers
         self._video_patchifier = VideoLatentPatchifier(patch_size=1)
@@ -170,6 +181,8 @@ class ValidationSampler:
         self._validate_config(config)
 
         # Route to appropriate generation method
+        if config.two_stage:
+            return self._generate_two_stage(config, device)
         if config.reference_video is not None:
             return self._generate_with_reference(config, device)
         return self._generate_standard(config, device)
@@ -318,6 +331,291 @@ class ValidationSampler:
 
         return video_output, audio_output
 
+    def _generate_two_stage(self, config: GenerationConfig, device: torch.device) -> tuple[Tensor, Tensor | None]:
+        """Two-stage generation: low-res → upsample → refine.
+
+        This follows the pattern from ti2vid_two_stages.py:
+        1. Stage 1: Generate at half resolution with CFG
+        2. Spatial upsampling in latent space (2x)
+        3. Stage 2: Refine at full resolution without CFG (distilled model)
+        """
+        if self._spatial_upsampler is None:
+            raise ValueError("Spatial upsampler is required for two-stage generation but was not provided")
+
+        # Get prompt embeddings (from cache or encode on-the-fly)
+        v_ctx_pos, a_ctx_pos, v_ctx_neg, a_ctx_neg = self._get_prompt_embeddings(config, device)
+
+        # Setup generator
+        generator = torch.Generator(device=device).manual_seed(config.seed)
+
+        # ==================== STAGE 1: Low-Resolution Generation ====================
+        logger.debug("Stage 1: Generating at half resolution")
+
+        # Calculate Stage 1 dimensions (half resolution)
+        stage1_width = config.width // 2
+        stage1_height = config.height // 2
+        stage1_config = GenerationConfig(
+            prompt=config.prompt,
+            negative_prompt=config.negative_prompt,
+            height=stage1_height,
+            width=stage1_width,
+            num_frames=config.num_frames,
+            frame_rate=config.frame_rate,
+            num_inference_steps=config.num_inference_steps,
+            guidance_scale=config.guidance_scale,
+            seed=config.seed,
+            condition_image=config.condition_image,
+            generate_audio=config.generate_audio,
+            cached_embeddings=config.cached_embeddings,
+            stg_scale=config.stg_scale,
+            stg_blocks=config.stg_blocks,
+            stg_mode=config.stg_mode,
+            tiled_decoding=config.tiled_decoding,
+            two_stage=False,  # Prevent recursion
+        )
+
+        # Create latent tools for Stage 1
+        video_tools_s1 = self._create_video_latent_tools(stage1_config)
+        audio_tools_s1 = self._create_audio_latent_tools(stage1_config) if config.generate_audio else None
+
+        # Initialize Stage 1 states
+        video_clean_state_s1 = video_tools_s1.create_initial_state(device=device, dtype=torch.bfloat16)
+        audio_clean_state_s1 = (
+            audio_tools_s1.create_initial_state(device=device, dtype=torch.bfloat16) if audio_tools_s1 else None
+        )
+
+        # Apply image conditioning at half resolution if provided
+        if config.condition_image is not None:
+            video_clean_state_s1 = self._apply_image_conditioning(
+                video_clean_state_s1,
+                config.condition_image,
+                stage1_config,
+                device,
+            )
+
+        # Add noise
+        noiser = GaussianNoiser(generator=generator)
+        video_state_s1 = noiser(latent_state=video_clean_state_s1, noise_scale=1.0)
+        audio_state_s1 = noiser(latent_state=audio_clean_state_s1, noise_scale=1.0) if audio_clean_state_s1 else None
+
+        # Stage 1 denoising WITH CFG
+        video_state_s1, audio_state_s1 = self._run_denoising(
+            config=stage1_config,
+            video_state=video_state_s1,
+            audio_state=audio_state_s1,
+            video_clean_state=video_clean_state_s1,
+            audio_clean_state=audio_clean_state_s1,
+            v_ctx_pos=v_ctx_pos,
+            a_ctx_pos=a_ctx_pos,
+            v_ctx_neg=v_ctx_neg,
+            a_ctx_neg=a_ctx_neg,
+            device=device,
+        )
+
+        # Unpatchify Stage 1 output
+        video_state_s1 = video_tools_s1.clear_conditioning(video_state_s1)
+        video_state_s1 = video_tools_s1.unpatchify(video_state_s1)
+
+        # ==================== SPATIAL UPSAMPLING ====================
+        logger.debug(f"Upsampling from {stage1_width}x{stage1_height} to {config.width}x{config.height}")
+
+        # Move upsampler to device
+        self._spatial_upsampler.to(device)
+
+        # Upsample video latent (2x spatial resolution)
+        # Input: [B, C, F, H/2, W/2] → Output: [B, C, F, H, W]
+        upscaled_latent = self._spatial_upsampler(
+            video_state_s1.latent[:1],  # Take first batch element
+            video_encoder=self._vae_encoder,
+        )
+
+        # Move upsampler back to CPU to save VRAM
+        self._spatial_upsampler.to("cpu")
+
+        # ==================== STAGE 2: Refinement at Full Resolution ====================
+        logger.debug("Stage 2: Refining at full resolution")
+
+        # Apply distilled LoRA to transformer (if configured)
+        self._apply_distilled_lora()
+
+        try:
+            # Create latent tools for Stage 2 (full resolution)
+            video_tools_s2 = self._create_video_latent_tools(config)
+            audio_tools_s2 = self._create_audio_latent_tools(config) if config.generate_audio else None
+
+            # Initialize Stage 2 video state with upscaled latent
+            # Note: We need to reconstruct the LatentState with correct positions for full resolution
+            video_clean_state_s2 = video_tools_s2.create_initial_state(device=device, dtype=torch.bfloat16)
+
+            # Replace the latent with upscaled version but keep the positions and other metadata
+            video_state_s2 = LatentState(
+                latent=upscaled_latent,
+                denoise_mask=video_clean_state_s2.denoise_mask,
+                positions=video_clean_state_s2.positions,
+                clean_latent=upscaled_latent,  # Use upscaled as "clean" for Stage 2
+            )
+
+            # Audio state remains from Stage 1 (no upsampling needed)
+            audio_state_s2 = audio_state_s1
+            audio_clean_state_s2 = audio_clean_state_s1
+
+            # Apply image conditioning at full resolution if provided
+            if config.condition_image is not None:
+                # Re-apply conditioning at full resolution for the first frame
+                video_clean_state_s2_conditioned = self._apply_image_conditioning(
+                    video_clean_state_s2,
+                    config.condition_image,
+                    config,
+                    device,
+                )
+                # Merge: use conditioned first frame, upscaled for rest
+                # This is done by updating the denoise_mask to indicate which parts are conditioned
+                video_state_s2 = LatentState(
+                    latent=upscaled_latent,
+                    denoise_mask=video_clean_state_s2_conditioned.denoise_mask,
+                    positions=video_clean_state_s2_conditioned.positions,
+                    clean_latent=video_clean_state_s2_conditioned.clean_latent,
+                )
+
+            # Create Stage 2 distilled scheduler (fixed 4 steps)
+            # Using the distilled sigma schedule: [0.909375, 0.725, 0.421875, 0.0]
+            distilled_sigmas = torch.tensor(
+                [0.909375, 0.725, 0.421875, 0.0],
+                device=device,
+                dtype=torch.float32,
+            )
+
+            # Stage 2 denoising WITHOUT CFG (distilled model)
+            # Create a config with guidance_scale=1.0 to disable CFG
+            stage2_config = GenerationConfig(
+                prompt=config.prompt,
+                negative_prompt=config.negative_prompt,
+                height=config.height,
+                width=config.width,
+                num_frames=config.num_frames,
+                frame_rate=config.frame_rate,
+                num_inference_steps=4,  # Fixed 4 steps for distilled
+                guidance_scale=1.0,  # Disable CFG
+                seed=config.seed,
+                generate_audio=config.generate_audio,
+                cached_embeddings=config.cached_embeddings,
+                stg_scale=0.0,  # Disable STG for Stage 2
+                tiled_decoding=config.tiled_decoding,
+                two_stage=False,
+            )
+
+            # Run Stage 2 denoising with distilled schedule
+            video_state_s2, audio_state_s2 = self._run_denoising(
+                config=stage2_config,
+                video_state=video_state_s2,
+                audio_state=audio_state_s2,
+                video_clean_state=video_state_s2,  # Use upscaled as "clean"
+                audio_clean_state=audio_clean_state_s2,
+                v_ctx_pos=v_ctx_pos,
+                a_ctx_pos=a_ctx_pos,
+                v_ctx_neg=None,  # No negative context for Stage 2
+                a_ctx_neg=None,
+                device=device,
+                sigmas=distilled_sigmas,  # Use distilled sigma schedule
+            )
+
+            # Decode Stage 2 outputs
+            video_state_s2 = video_tools_s2.clear_conditioning(video_state_s2)
+            video_state_s2 = video_tools_s2.unpatchify(video_state_s2)
+            video_output = self._decode_video(video_state_s2, device, config.tiled_decoding)
+
+            audio_output = None
+            if audio_state_s2 is not None and audio_tools_s2 is not None:
+                audio_state_s2 = audio_tools_s2.clear_conditioning(audio_state_s2)
+                audio_state_s2 = audio_tools_s2.unpatchify(audio_state_s2)
+                audio_output = self._decode_audio(audio_state_s2, device)
+
+            return video_output, audio_output
+
+        finally:
+            # Remove distilled LoRA from transformer
+            self._remove_distilled_lora()
+
+    def prepare_distilled_lora(
+        self,
+        lora_path: str,
+        lora_strength: float,
+    ) -> None:
+        """Store distilled LoRA configuration for Stage 2.
+
+        The distilled transformer will be loaded on-demand during Stage 2 generation
+        using the load/unload pattern from ti2vid_two_stages.
+
+        Args:
+            lora_path: Path to distilled LoRA checkpoint
+            lora_strength: Strength/scale factor for LoRA (typically 1.0)
+        """
+        from ltx_core.loader.primitives import LoraPathStrengthAndSDOps
+
+        if self._checkpoint_path is None:
+            raise ValueError("checkpoint_path is required for distilled LoRA loading")
+
+        self._distilled_lora_config = LoraPathStrengthAndSDOps(
+            path=lora_path,
+            strength=lora_strength,
+            sd_ops=None,  # Use default key mapping
+        )
+        logger.debug(f"Prepared distilled LoRA configuration: {lora_path} (strength={lora_strength})")
+
+    def _apply_distilled_lora(self) -> None:
+        """Load transformer with distilled LoRA for Stage 2.
+
+        This follows the ti2vid_two_stages pattern:
+        1. Save reference to base transformer and move to CPU
+        2. Load fresh transformer with distilled LoRA applied
+        3. Move new transformer to GPU for Stage 2 inference
+        """
+        if self._distilled_lora_config is None:
+            # No distilled LoRA configured - Stage 2 will use base transformer
+            return
+
+        from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
+        from ltx_core.model.transformer import LTXV_MODEL_COMFY_RENAMING_MAP, LTXModelConfigurator
+
+        # Save base transformer and get its device before moving to CPU
+        self._base_transformer = self._transformer
+        base_device = next(self._base_transformer.parameters()).device
+        self._transformer.to("cpu")
+        logger.debug("Moved base transformer to CPU")
+
+        # Load transformer with distilled LoRA from checkpoint
+        builder = SingleGPUModelBuilder(
+            model_path=str(self._checkpoint_path),
+            model_class_configurator=LTXModelConfigurator,
+            model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
+            loras=(self._distilled_lora_config,),
+        )
+
+        self._transformer = builder.build(device=base_device, dtype=torch.bfloat16).eval()
+        logger.debug(f"Loaded transformer with distilled LoRA for Stage 2")
+
+    def _remove_distilled_lora(self) -> None:
+        """Restore base transformer after Stage 2.
+
+        This cleans up the distilled transformer and restores the original
+        base transformer used for training and Stage 1.
+        """
+        if not hasattr(self, "_base_transformer"):
+            return
+
+        # Get device before deleting distilled transformer
+        device = next(self._transformer.parameters()).device
+
+        # Delete distilled transformer
+        del self._transformer
+        torch.cuda.empty_cache()
+        logger.debug("Deleted distilled transformer from GPU")
+
+        # Restore base transformer
+        self._transformer = self._base_transformer.to(device)
+        del self._base_transformer
+        logger.debug("Restored base transformer after Stage 2")
+
     def _create_video_latent_tools(self, config: GenerationConfig) -> VideoLatentTools:
         """Create video latent tools for the given configuration."""
         pixel_shape = VideoPixelShape(
@@ -458,10 +756,20 @@ class ValidationSampler:
         v_ctx_neg: Tensor | None,
         a_ctx_neg: Tensor | None,
         device: torch.device,
+        sigmas: Tensor | None = None,
     ) -> tuple[LatentState, LatentState | None]:
-        """Run the denoising loop using X0 prediction with CFG and optional STG."""
-        scheduler = LTX2Scheduler()
-        sigmas = scheduler.execute(steps=config.num_inference_steps).to(device).float()
+        """Run the denoising loop using X0 prediction with CFG and optional STG.
+
+        Args:
+            sigmas: Optional pre-computed sigma schedule. If None, computes from config.num_inference_steps.
+        """
+        # Compute sigmas if not provided (standard behavior)
+        if sigmas is None:
+            scheduler = LTX2Scheduler()
+            sigmas = scheduler.execute(steps=config.num_inference_steps).to(device).float()
+        else:
+            # Ensure sigmas are on the correct device and dtype
+            sigmas = sigmas.to(device).float()
         stepper = EulerDiffusionStep()
         cfg_guider = CFGGuider(config.guidance_scale)
         stg_guider = STGGuider(config.stg_scale)
