@@ -423,6 +423,7 @@ class ValidationSampler:
 
         # Upsample video latent (2x spatial resolution)
         # Input: [B, C, F, H/2, W/2] → Output: [B, C, F, H, W]
+        print(f"num_frames == {config.num_frames}")
         print(f"video_state_s1.latent.shape == {video_state_s1.latent.shape}")
         upscaled_latent = upsample_video(
             video_state_s1.latent[:1],  # Take first batch element
