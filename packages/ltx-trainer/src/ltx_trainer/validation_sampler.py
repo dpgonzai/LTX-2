@@ -28,6 +28,7 @@ from ltx_core.guidance.perturbations import (
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.model import X0Model
 from ltx_core.model.video_vae import SpatialTilingConfig, TemporalTilingConfig, TilingConfig
+from ltx_core.model.upsampler import upsample_video
 from ltx_core.tools import AudioLatentTools, VideoLatentTools
 from ltx_core.types import AudioLatentShape, LatentState, SpatioTemporalScaleFactors, VideoLatentShape, VideoPixelShape
 from ltx_trainer.progress import SamplingContext
@@ -422,9 +423,10 @@ class ValidationSampler:
 
         # Upsample video latent (2x spatial resolution)
         # Input: [B, C, F, H/2, W/2] → Output: [B, C, F, H, W]
-        upscaled_latent = self._spatial_upsampler(
+        upscaled_latent = upsample_video(
             video_state_s1.latent[:1],  # Take first batch element
             video_encoder=self._vae_encoder,
+            upsampler=self._spatial_upsampler
         )
 
         # Move upsampler back to CPU to save VRAM
