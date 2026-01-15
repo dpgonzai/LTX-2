@@ -573,10 +573,9 @@ class ValidationSampler:
             print("Transformer is not PEFT-wrapped, skipping distilled LoRA")
             return
 
-        # 1. Export training LoRA to temporary file
+        # 1. Export training LoRA to temporary directory
         print("Exporting training LoRA for Stage 2")
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".safetensors", mode='wb') as f:
-            self._temp_training_lora_path = f.name
+        self._temp_training_lora_path = tempfile.mkdtemp(prefix="training_lora_")
 
         # Export only the adapter weights (not full model)
         self._transformer.save_pretrained(
