@@ -586,11 +586,19 @@ class ValidationSampler:
 
         # 2. Build list of LoRAs to apply (training + distilled)
         from ltx_core.loader.primitives import LoraPathStrengthAndSDOps
+        import os
+
+        # PEFT save_pretrained creates adapter_model.safetensors inside the directory
+        training_lora_file = os.path.join(self._temp_training_lora_path, "adapter_model.safetensors")
+        if not os.path.exists(training_lora_file):
+            print(f"Warning: Training LoRA file not found at {training_lora_file}")
+            print(f"Directory contents: {os.listdir(self._temp_training_lora_path)}")
+            return
 
         loras_to_apply = [
             # Training LoRA (exported from PEFT)
             LoraPathStrengthAndSDOps(
-                path=self._temp_training_lora_path,
+                path=training_lora_file,  # Path to actual .safetensors file
                 strength=1.0,
                 sd_ops=None,
             ),
