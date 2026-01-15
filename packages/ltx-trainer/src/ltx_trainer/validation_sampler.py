@@ -130,6 +130,7 @@ class ValidationSampler:
         audio_decoder: "AudioDecoder | None" = None,
         vocoder: "Vocoder | None" = None,
         spatial_upsampler: "LatentUpsampler | None" = None,
+        checkpoint_path: str | None = None,
         sampling_context: SamplingContext | None = None,
     ):
         """Initialize the validation sampler.
@@ -141,6 +142,7 @@ class ValidationSampler:
             audio_decoder: Optional audio VAE decoder (for audio generation)
             vocoder: Optional vocoder (for audio generation)
             spatial_upsampler: Optional spatial upsampler (for two-stage generation)
+            checkpoint_path: Optional path to base model checkpoint (required for two-stage with dual LoRAs)
             sampling_context: Optional SamplingContext for progress display during denoising
         """
         self._transformer = transformer
@@ -150,6 +152,7 @@ class ValidationSampler:
         self._audio_decoder = audio_decoder
         self._vocoder = vocoder
         self._spatial_upsampler = spatial_upsampler
+        self._checkpoint_path = checkpoint_path
         self._sampling_context = sampling_context
 
         # Distilled LoRA configuration (loaded on-demand for Stage 2 of two-stage generation)
@@ -522,48 +525,47 @@ class ValidationSampler:
         self,
         lora_path: str,
         lora_strength: float,
-        lora_rank: int = 384,
-        lora_alpha: int | None = None,
     ) -> None:
         """Store distilled LoRA configuration for Stage 2.
 
-        The distilled LoRA will be added as a second adapter to the existing PEFT-wrapped
-        transformer during Stage 2 generation. Target modules will be automatically extracted
-        from the LoRA checkpoint.
+        The distilled LoRA will be applied along with the training LoRA via
+        SingleGPUModelBuilder during Stage 2 generation.
 
         Args:
             lora_path: Path to distilled LoRA checkpoint (ComfyUI format)
             lora_strength: Strength/scale factor for LoRA (typically 1.0)
-            lora_rank: LoRA rank (must match checkpoint, typically 384 for distilled)
-            lora_alpha: LoRA alpha (typically equals rank if None)
         """
-        from pathlib import Path
+        from ltx_core.loader.primitives import LoraPathStrengthAndSDOps
 
-        self._distilled_lora_config = {
-            "path": Path(lora_path),
-            "strength": lora_strength,
-            "rank": lora_rank,
-            "alpha": lora_alpha if lora_alpha is not None else lora_rank,
-        }
+        self._distilled_lora_config = LoraPathStrengthAndSDOps(
+            path=lora_path,
+            strength=lora_strength,
+            sd_ops=None,  # Use default key mapping
+        )
 
     def _apply_distilled_lora(self) -> None:
-        """Add distilled LoRA as second adapter to PEFT-wrapped transformer.
+        """Load transformer with both training and distilled LoRAs for Stage 2.
 
         This approach:
-        1. Loads distilled LoRA weights from ComfyUI format safetensors
-        2. Extracts target modules from the state dict keys
-        3. Creates empty "distilled" adapter with matching config
-        4. Remaps keys from ComfyUI format to PEFT format
-        5. Loads weights into the distilled adapter
-        6. Activates both "default" (training) and "distilled" adapters
+        1. Exports training LoRA from PEFT model to temporary file
+        2. Saves reference to base PEFT-wrapped transformer and moves to CPU
+        3. Loads fresh transformer with BOTH LoRAs applied via SingleGPUModelBuilder
+        4. Moves new transformer to GPU for Stage 2 inference
 
-        Memory usage: ~200-400 MB (just the adapter weights)
-        vs ~8 GB for loading a fresh transformer
+        The apply_loras() function sums the deltas from both LoRAs:
+        final_weight = base_weight + training_lora_delta + distilled_lora_delta
+
+        Memory usage: ~8-9 GB peak (fresh transformer load)
         """
-        from peft import LoraConfig, PeftModel
-        from safetensors.torch import load_file
+        from peft import PeftModel
+        import tempfile
 
         if self._distilled_lora_config is None:
+            return
+
+        # Ensure we have checkpoint_path for loading fresh transformer
+        if self._checkpoint_path is None:
+            print("checkpoint_path is required for dual-LoRA Stage 2, skipping")
             return
 
         # Ensure transformer is PEFT-wrapped
@@ -571,115 +573,93 @@ class ValidationSampler:
             print("Transformer is not PEFT-wrapped, skipping distilled LoRA")
             return
 
-        # 1. Load distilled LoRA state dict from ComfyUI format
-        lora_path = self._distilled_lora_config["path"]
-        print(f"Loading distilled LoRA from {lora_path}")
-        state_dict = load_file(str(lora_path))
+        # 1. Export training LoRA to temporary file
+        print("Exporting training LoRA for Stage 2")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".safetensors", mode='wb') as f:
+            self._temp_training_lora_path = f.name
 
-        # 2. Extract target modules from state dict keys
-        # Any module with .lora_A.weight is a target module
-        target_modules = set()
-        for key in state_dict.keys():
-            if ".lora_A.weight" in key:
-                # Remove prefix and suffix to get module name
-                # e.g., "diffusion_model.transformer_blocks.0.attn.to_q.lora_A.weight"
-                #    -> "transformer_blocks.0.attn.to_q"
-                key_clean = key.replace("diffusion_model.", "").replace("text_embedding_projection.", "")
-                module_name = key_clean.replace(".lora_A.weight", "")
-                target_modules.add(module_name)
+        # Export only the adapter weights (not full model)
+        self._transformer.save_pretrained(
+            self._temp_training_lora_path,
+            safe_serialization=True,
+        )
+        print(f"Exported training LoRA to {self._temp_training_lora_path}")
 
-        target_modules = sorted(target_modules)  # For deterministic ordering
-        print(f"Extracted {len(target_modules)} target modules from distilled LoRA")
+        # 2. Build list of LoRAs to apply (training + distilled)
+        from ltx_core.loader.primitives import LoraPathStrengthAndSDOps
 
-        # 3. Create empty distilled adapter
-        distilled_config = LoraConfig(
-            r=self._distilled_lora_config["rank"],
-            lora_alpha=self._distilled_lora_config["alpha"],
-            target_modules=target_modules,
-            lora_dropout=0.0,
-            bias="none",
-            task_type=None,  # Not using task-specific config
+        loras_to_apply = [
+            # Training LoRA (exported from PEFT)
+            LoraPathStrengthAndSDOps(
+                path=self._temp_training_lora_path,
+                strength=1.0,
+                sd_ops=None,
+            ),
+            # Distilled LoRA (from config)
+            self._distilled_lora_config,
+        ]
+
+        # 3. Save base transformer and move to CPU
+        self._base_transformer = self._transformer
+        base_device = next(self._base_transformer.parameters()).device
+        self._transformer.to("cpu")
+        print("Moved base transformer to CPU")
+
+        # 4. Load fresh transformer with both LoRAs
+        from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
+        from ltx_core.model.transformer import LTXV_MODEL_COMFY_RENAMING_MAP, LTXModelConfigurator
+
+        print("Loading fresh transformer with training + distilled LoRAs")
+        builder = SingleGPUModelBuilder(
+            model_path=str(self._checkpoint_path),
+            model_class_configurator=LTXModelConfigurator,
+            model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
+            loras=tuple(loras_to_apply),  # Both LoRAs applied!
         )
 
-        print(
-            f"Adding distilled adapter with rank={distilled_config.r}, "
-            f"alpha={distilled_config.lora_alpha}, "
-            f"num_target_modules={len(target_modules)}"
-        )
-        self._transformer.add_adapter("distilled", distilled_config)
-
-        # 4. Remap keys from ComfyUI format to PEFT format
-        # ComfyUI: "diffusion_model.transformer.blocks.0.attn.to_q.lora_A.weight"
-        # PEFT:    "transformer.blocks.0.attn.to_q.lora_A.distilled.weight"
-        # Also handle: "text_embedding_projection.aggregate_embed.lora_A.weight"
-        remapped_state_dict = {}
-        for key, value in state_dict.items():
-            # Skip non-LoRA keys
-            if ".lora_A.weight" not in key and ".lora_B.weight" not in key:
-                continue
-
-            # Remove prefixes that don't exist in model
-            key_clean = key.replace("diffusion_model.", "").replace("text_embedding_projection.", "")
-
-            # Insert adapter name before ".weight"
-            # e.g., "transformer.blocks.0.attn.to_q.lora_A.weight" →
-            #       "transformer.blocks.0.attn.to_q.lora_A.distilled.weight"
-            key_peft = key_clean.replace(".weight", ".distilled.weight")
-            remapped_state_dict[key_peft] = value
-
-        print(f"Remapped {len(remapped_state_dict)} LoRA weight keys")
-
-        # 5. Load remapped weights into the distilled adapter
-        from peft.utils import set_peft_model_state_dict
-
-        set_peft_model_state_dict(
-            self._transformer,
-            remapped_state_dict,
-            adapter_name="distilled",
-        )
-
-        # 6. Create a merged adapter combining both training and distilled
-        # This creates a new adapter "stage2" that sums the effects of both LoRAs
-        print("Creating merged 'stage2' adapter from 'default' + 'distilled'")
-        self._transformer.add_weighted_adapter(
-            adapters=["default", "distilled"],
-            weights=[1.0, 1.0],  # Full strength for both
-            adapter_name="stage2",
-            combination_type="linear",  # Simple addition of LoRA deltas
-        )
-
-        # Activate the merged adapter for Stage 2
-        self._transformer.set_adapter("stage2")
-        print("Activated merged 'stage2' adapter combining training + distilled LoRAs")
+        self._transformer = builder.build(device=base_device, dtype=torch.bfloat16).eval()
+        print("Loaded transformer with both LoRAs for Stage 2")
 
     def _remove_distilled_lora(self) -> None:
-        """Remove distilled LoRA adapters and restore training-only mode.
+        """Restore base transformer after Stage 2.
 
-        This cleans up the temporary adapters created for Stage 2:
-        - "stage2" (merged adapter)
-        - "distilled" (distilled LoRA adapter)
-
-        And returns the transformer to its training state with only the
-        "default" (training) adapter active.
+        This cleans up the fresh transformer with both LoRAs and restores the
+        original PEFT-wrapped transformer used for training and Stage 1.
+        Also deletes the temporary training LoRA export file.
         """
-        from peft import PeftModel
+        import os
 
-        if not isinstance(self._transformer, PeftModel):
+        if not hasattr(self, "_base_transformer"):
             return
 
-        # Switch back to training adapter only
-        self._transformer.set_adapter("default")
-        print("Switched back to 'default' adapter")
+        # Get device before deleting dual-LoRA transformer
+        device = next(self._transformer.parameters()).device
 
-        # Delete stage2 merged adapter if it exists
-        if "stage2" in self._transformer.peft_config:
-            self._transformer.delete_adapter("stage2")
-            print("Deleted 'stage2' merged adapter")
+        # Delete dual-LoRA transformer
+        del self._transformer
+        torch.cuda.empty_cache()
+        print("Deleted dual-LoRA transformer from GPU")
 
-        # Delete distilled adapter if it exists
-        if "distilled" in self._transformer.peft_config:
-            self._transformer.delete_adapter("distilled")
-            print("Deleted 'distilled' adapter")
+        # Restore base PEFT-wrapped transformer
+        self._transformer = self._base_transformer.to(device)
+        del self._base_transformer
+        print("Restored base transformer for training")
+
+        # Clean up temporary training LoRA file
+        if hasattr(self, "_temp_training_lora_path"):
+            try:
+                # Remove the directory created by save_pretrained
+                if os.path.isdir(self._temp_training_lora_path):
+                    import shutil
+                    shutil.rmtree(self._temp_training_lora_path)
+                    print(f"Cleaned up temporary training LoRA directory: {self._temp_training_lora_path}")
+                elif os.path.isfile(self._temp_training_lora_path):
+                    os.unlink(self._temp_training_lora_path)
+                    print(f"Cleaned up temporary training LoRA file: {self._temp_training_lora_path}")
+            except Exception as e:
+                print(f"Warning: Failed to clean up temporary LoRA: {e}")
+            finally:
+                del self._temp_training_lora_path
 
     def _create_video_latent_tools(self, config: GenerationConfig) -> VideoLatentTools:
         """Create video latent tools for the given configuration."""

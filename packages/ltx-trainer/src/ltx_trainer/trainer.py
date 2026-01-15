@@ -899,6 +899,7 @@ class LtxvTrainer:
                 audio_decoder=self._audio_vae if generate_audio else None,
                 vocoder=self._vocoder if generate_audio else None,
                 spatial_upsampler=self._spatial_upsampler,
+                checkpoint_path=self._config.model.model_path,
                 sampling_context=sampling_ctx,
             )
 
@@ -907,8 +908,6 @@ class LtxvTrainer:
                 sampler.prepare_distilled_lora(
                     lora_path=self._config.validation.distilled_lora_path,
                     lora_strength=self._config.validation.distilled_lora_strength,
-                    lora_rank=384,  # Distilled LoRA uses rank 384
-                    lora_alpha=384,  # Alpha typically equals rank
                 )
 
             output_dir = Path(self._config.output_dir) / "samples"
