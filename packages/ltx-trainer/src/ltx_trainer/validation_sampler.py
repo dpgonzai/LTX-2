@@ -638,14 +638,28 @@ class ValidationSampler:
             adapter_name="distilled",
         )
 
-        # 6. Activate both adapters (training + distilled)
-        self._transformer.set_adapter(["default", "distilled"])
-        print("Activated both 'default' and 'distilled' adapters for Stage 2")
+        # 6. Create a merged adapter combining both training and distilled
+        # This creates a new adapter "stage2" that sums the effects of both LoRAs
+        print("Creating merged 'stage2' adapter from 'default' + 'distilled'")
+        self._transformer.add_weighted_adapter(
+            adapters=["default", "distilled"],
+            weights=[1.0, 1.0],  # Full strength for both
+            adapter_name="stage2",
+            combination_type="linear",  # Simple addition of LoRA deltas
+        )
+
+        # Activate the merged adapter for Stage 2
+        self._transformer.set_adapter("stage2")
+        print("Activated merged 'stage2' adapter combining training + distilled LoRAs")
 
     def _remove_distilled_lora(self) -> None:
-        """Remove distilled LoRA adapter and restore training-only mode.
+        """Remove distilled LoRA adapters and restore training-only mode.
 
-        This returns the transformer to its training state with only the
+        This cleans up the temporary adapters created for Stage 2:
+        - "stage2" (merged adapter)
+        - "distilled" (distilled LoRA adapter)
+
+        And returns the transformer to its training state with only the
         "default" (training) adapter active.
         """
         from peft import PeftModel
@@ -653,17 +667,19 @@ class ValidationSampler:
         if not isinstance(self._transformer, PeftModel):
             return
 
-        # Check if distilled adapter exists
-        if "distilled" not in self._transformer.peft_config:
-            return
-
         # Switch back to training adapter only
         self._transformer.set_adapter("default")
         print("Switched back to 'default' adapter")
 
-        # Delete distilled adapter to free memory
-        self._transformer.delete_adapter("distilled")
-        print("Deleted 'distilled' adapter")
+        # Delete stage2 merged adapter if it exists
+        if "stage2" in self._transformer.peft_config:
+            self._transformer.delete_adapter("stage2")
+            print("Deleted 'stage2' merged adapter")
+
+        # Delete distilled adapter if it exists
+        if "distilled" in self._transformer.peft_config:
+            self._transformer.delete_adapter("distilled")
+            print("Deleted 'distilled' adapter")
 
     def _create_video_latent_tools(self, config: GenerationConfig) -> VideoLatentTools:
         """Create video latent tools for the given configuration."""
