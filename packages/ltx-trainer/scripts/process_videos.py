@@ -185,10 +185,7 @@ class MediaDataset(Dataset):
         try:
             # torchaudio can extract audio from video files directly
             # waveform shape: [channels, samples]
-            if str(video_path).endswith('.mp4'):
-                print("Overriding format of file to mov")
-            print(torchaudio.utils.ffmpeg_utils.get_audio_decoders())
-            waveform, sample_rate = torchaudio.load(str(video_path), format="mov")
+            waveform, sample_rate = torchaudio.load(str(video_path))
 
             # Trim or pad to target duration
             target_samples = int(target_duration * sample_rate)
