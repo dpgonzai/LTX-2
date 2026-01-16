@@ -1023,12 +1023,36 @@ class LtxvTrainer:
 
     @contextmanager
     def _offload_to_cpu(self):
-        models = [model for model in [self._transformer, self._vae_decoder, self._vae_encoder,
-                  self._audio_vae, self._vocoder, self._spatial_upsampler] if model is not None]
-        devices = [next(model.parameters()).device for model in models]
+        """Offload models and optimizer states to CPU to maximize available GPU memory."""
+        # Unwrap transformer from Accelerate for proper CPU offload
+        unwrapped_transformer = self._accelerator.unwrap_model(self._transformer)
+        transformer_device = next(unwrapped_transformer.parameters()).device
 
-        for model in models:
-            model.to("cpu")
+        # Offload transformer
+        unwrapped_transformer.to("cpu")
+
+        # Offload text encoder embedding connectors if present
+        text_encoder_state = {}
+        if self._text_encoder is not None:
+            if hasattr(self._text_encoder, 'video_connector') and self._text_encoder.video_connector is not None:
+                text_encoder_state['video_connector'] = self._text_encoder.video_connector.weight.device
+                self._text_encoder.video_connector.to("cpu")
+            if hasattr(self._text_encoder, 'audio_connector') and self._text_encoder.audio_connector is not None:
+                text_encoder_state['audio_connector'] = self._text_encoder.audio_connector.weight.device
+                self._text_encoder.audio_connector.to("cpu")
+
+        # Offload optimizer states (can be significant for Adam/AdamW)
+        optimizer_state_backup = []
+        for param_group in self._optimizer.param_groups:
+            for param in param_group['params']:
+                if param in self._optimizer.state:
+                    state = self._optimizer.state[param]
+                    state_device = {}
+                    for key, value in state.items():
+                        if isinstance(value, torch.Tensor):
+                            state_device[key] = value.device
+                            state[key] = value.cpu()
+                    optimizer_state_backup.append((param, state_device))
 
         free_gpu_memory()
 
@@ -1036,8 +1060,21 @@ class LtxvTrainer:
             yield
         finally:
             free_gpu_memory()
-            for model, device in zip(models, devices):
-                model.to(device)
+
+            # Restore optimizer states
+            for param, state_devices in optimizer_state_backup:
+                state = self._optimizer.state[param]
+                for key, device in state_devices.items():
+                    state[key] = state[key].to(device)
+
+            # Restore text encoder connectors
+            if hasattr(self._text_encoder, 'video_connector') and 'video_connector' in text_encoder_state:
+                self._text_encoder.video_connector.to(text_encoder_state['video_connector'])
+            if hasattr(self._text_encoder, 'audio_connector') and 'audio_connector' in text_encoder_state:
+                self._text_encoder.audio_connector.to(text_encoder_state['audio_connector'])
+
+            # Restore transformer
+            unwrapped_transformer.to(transformer_device)
 
     def _save_checkpoint(self) -> Path | None:
         """Save the model weights."""
