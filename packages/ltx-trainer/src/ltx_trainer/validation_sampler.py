@@ -367,7 +367,7 @@ class ValidationSampler:
             condition_image=config.condition_image,
             generate_audio=config.generate_audio,
             cached_embeddings=config.cached_embeddings,
-            stg_scale=config.stg_scale,
+            stg_scale=0.0, #config.stg_scale,
             stg_blocks=config.stg_blocks,
             stg_mode=config.stg_mode,
             tiled_decoding=config.tiled_decoding,
