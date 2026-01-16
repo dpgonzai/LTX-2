@@ -301,7 +301,7 @@ class LtxvTrainer:
                         # and self._global_step > 0
                         and self._global_step % cfg.checkpoints.interval == 0
                         and is_optimization_step
-                    ):
+                    ) or self._global_step == 1 and is_optimization_step:
                         saved_path = self._save_checkpoint()
 
                     self._accelerator.wait_for_everyone()
@@ -1024,12 +1024,19 @@ class LtxvTrainer:
     @contextmanager
     def _offload_to_cpu(self):
         """Offload models and optimizer states to CPU to maximize available GPU memory."""
+        # Log GPU memory before offloading to CPU
+        gpu_memory_gb = get_gpu_memory_gb(self._accelerator.device)
+        logger.info(f"GPU memory before offloading to CPU: {gpu_memory_gb:.2f} GB")
+
         # Unwrap transformer from Accelerate for proper CPU offload
         unwrapped_transformer = self._accelerator.unwrap_model(self._transformer)
         transformer_device = next(unwrapped_transformer.parameters()).device
+        print(f"Transformer device before offload: {transformer_device}")
 
         # Offload transformer
         unwrapped_transformer.to("cpu")
+
+        print(f"Transformer device after offload: {next(unwrapped_transformer.parameters()).device}")
 
         # Offload text encoder embedding connectors if present
         text_encoder_state = {}
@@ -1055,6 +1062,10 @@ class LtxvTrainer:
                     optimizer_state_backup.append((param, state_device))
 
         free_gpu_memory()
+
+        # Log GPU memory after offloading to CPU
+        gpu_memory_gb = get_gpu_memory_gb(self._accelerator.device)
+        logger.info(f"GPU memory after offloading to CPU: {gpu_memory_gb:.2f} GB")
 
         try:
             yield
