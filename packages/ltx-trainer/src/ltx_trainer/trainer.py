@@ -1028,6 +1028,9 @@ class LtxvTrainer:
         gpu_memory_gb = get_gpu_memory_gb(self._accelerator.device)
         logger.info(f"GPU memory before offloading to CPU: {gpu_memory_gb:.2f} GB")
 
+        # Zero gradients and free memory
+        self._optimizer.zero_grad(set_to_none=True)
+
         # Unwrap transformer from Accelerate for proper CPU offload
         unwrapped_transformer = self._accelerator.unwrap_model(self._transformer)
         transformer_device = next(unwrapped_transformer.parameters()).device
@@ -1066,6 +1069,10 @@ class LtxvTrainer:
         # Log GPU memory after offloading to CPU
         gpu_memory_gb = get_gpu_memory_gb(self._accelerator.device)
         logger.info(f"GPU memory after offloading to CPU: {gpu_memory_gb:.2f} GB")
+
+        # Detailed memory breakdown for debugging
+        if torch.cuda.is_available():
+            logger.info("\n" + torch.cuda.memory_summary(device=self._accelerator.device, abbreviated=True))
 
         try:
             yield
@@ -1128,12 +1135,21 @@ class LtxvTrainer:
 
             # Save to disk
             save_file(state_dict, saved_weights_path)
+
+            # Free state dict memory immediately after saving
+            del state_dict
+            del full_state_dict
+            free_gpu_memory()
         else:
             # Cast to configured precision
             full_state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in full_state_dict.items()}
 
             # Save to disk
             self._accelerator.save(full_state_dict, saved_weights_path)
+
+            # Free state dict memory immediately after saving
+            del full_state_dict
+            free_gpu_memory()
 
         rel_path = saved_weights_path.relative_to(self._config.output_dir)
         logger.info(f"💾 {prefix.capitalize()} weights for step {self._global_step} saved in {rel_path}")
