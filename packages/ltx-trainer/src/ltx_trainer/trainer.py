@@ -298,7 +298,7 @@ class LtxvTrainer:
                     # Save checkpoint if needed
                     if (
                         cfg.checkpoints.interval
-                        and self._global_step > 0
+                        # and self._global_step > 0
                         and self._global_step % cfg.checkpoints.interval == 0
                         and is_optimization_step
                     ):
