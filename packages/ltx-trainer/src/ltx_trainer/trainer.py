@@ -3,6 +3,7 @@ import time
 import warnings
 from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
+from contextlib import contextmanager
 
 import torch
 import wandb
@@ -216,6 +217,7 @@ class LtxvTrainer:
 
         peak_mem_during_training = start_mem
 
+        saved_path = None
         sampled_videos_paths = None
 
         with progress:
@@ -300,7 +302,7 @@ class LtxvTrainer:
                         and self._global_step % cfg.checkpoints.interval == 0
                         and is_optimization_step
                     ):
-                        self._save_checkpoint()
+                        saved_path = self._save_checkpoint()
 
                     self._accelerator.wait_for_everyone()
 
@@ -1019,6 +1021,24 @@ class LtxvTrainer:
             stats_str += f" - Global batch size: {stats.global_batch_size}"
         logger.info(stats_str)
 
+    @contextmanager
+    def _offload_to_cpu(self):
+        models = [model for model in [self._transformer, self._vae_decoder, self._vae_encoder,
+                  self._audio_vae, self._vocoder, self._spatial_upsampler] if model is not None]
+        devices = [next(model.parameters()).device for model in models]
+
+        for model in models:
+            model.to("cpu")
+
+        free_gpu_memory()
+
+        try:
+            yield
+        finally:
+            free_gpu_memory()
+            for model, device in zip(models, devices):
+                model.to(device)
+
     def _save_checkpoint(self) -> Path | None:
         """Save the model weights."""
         is_lora = self._config.model.training_mode == "lora"
@@ -1026,9 +1046,6 @@ class LtxvTrainer:
 
         # Prepare paths
         save_dir = Path(self._config.output_dir) / "checkpoints"
-
-        for callback in self._callbacks:
-            callback.on_save(self._global_step, save_dir)
 
         prefix = "lora" if is_lora else "model"
         filename = f"{prefix}_weights_step_{self._global_step:05d}.safetensors"
@@ -1076,6 +1093,12 @@ class LtxvTrainer:
         # Keep track of checkpoint paths, and cleanup old checkpoints if needed
         self._checkpoint_paths.append(saved_weights_path)
         self._cleanup_checkpoints()
+
+        # Offload models to cpu so the on_save can run the pipeline on gpu
+        with self._offload_to_cpu():
+            for callback in self._callbacks:
+                callback.on_save(self._global_step, saved_weights_path)
+
         return saved_weights_path
 
     def _cleanup_checkpoints(self) -> None:
